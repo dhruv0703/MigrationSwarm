@@ -138,6 +138,43 @@ For packaging validation:
 ```powershell
 python scripts/validate_clean_install.py
 ```
+## How MigrationSwarm Differs
+
+MigrationSwarm is an experimental Java/Spring Boot modernization system focused not only on identifying service boundaries, but on executing and validating the migration workflow end to end.
+
+Existing tools such as IBM Mono2Micro focus primarily on decomposing monolithic Java applications and recommending candidate microservice boundaries using static and runtime analysis.
+
+MigrationSwarm explores a complementary approach built around orchestration and verification:
+
+- deterministic repository and dependency analysis
+- LLM-assisted service-boundary reasoning
+- explicit task DAGs and multi-worker execution
+- isolated Git worktrees for code-changing operations
+- automated service extraction
+- real Maven build and test verification
+- bounded debug and repair loops
+- semantic behavior validation
+- fail-closed handling when evidence is incomplete
+- human-review escalation for unsafe or ambiguous decompositions
+
+The goal is not to claim automatic correctness or replace architectural judgment. MigrationSwarm treats modernization as an evidence-driven workflow where model-generated decisions must survive deterministic checks, builds, tests, and behavioral validation before being accepted.
+
+### Positioning
+
+| Capability | MigrationSwarm | Typical decomposition tools |
+|---|---|---|
+| Service-boundary discovery | Yes | Yes |
+| Static dependency analysis | Yes | Yes |
+| LLM-assisted reasoning | Yes | Varies |
+| Automated code extraction | Yes | Varies |
+| Git-isolated transformation | Yes | Typically not a core focus |
+| Build/test verification | Yes | Varies |
+| Bounded automated repair | Yes | Typically not a core focus |
+| Semantic behavior checks | Yes | Varies |
+| Human-review fallback | Yes | Varies |
+| Multi-worker orchestration | Yes | Typically not a core focus |
+
+MigrationSwarm should therefore be viewed as a research-oriented modernization execution and verification system rather than only a microservice-boundary recommendation tool.
 
 ## Evaluation
 
