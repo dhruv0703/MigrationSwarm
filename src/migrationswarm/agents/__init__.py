@@ -121,6 +121,7 @@ from migrationswarm.agents.service_boundary import (
 )
 from migrationswarm.agents.service_extraction import (
     EXTRACTION_RESULTS_DIR,
+    ExtractionContextSelection,
     ExtractionDependency,
     ExtractionDependencyKind,
     ExtractionEvidenceError,
@@ -234,6 +235,7 @@ __all__ = [
     "ServiceBoundaryReport",
     "SharedDependency",
     "EXTRACTION_RESULTS_DIR",
+    "ExtractionContextSelection",
     "ExtractionDependency",
     "ExtractionDependencyKind",
     "ExtractionEvidenceError",

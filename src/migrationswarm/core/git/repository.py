@@ -59,11 +59,18 @@ class GitRepository:
 
     def is_dirty(self) -> bool:
         """Return whether tracked or untracked files have changed."""
-        return bool(self._run("status", "--porcelain=v1", "--untracked-files=all").strip())
+        return bool(self.status_porcelain().strip())
+
+    def status_porcelain(self, *, include_ignored: bool = False) -> str:
+        """Return Git porcelain status, optionally including ignored paths."""
+        arguments = ["status", "--porcelain=v1", "--untracked-files=all"]
+        if include_ignored:
+            arguments.append("--ignored=matching")
+        return self._run(*arguments)
 
     def changed_files(self) -> tuple[str, ...]:
         """Return changed tracked and untracked paths in deterministic order."""
-        output = self._run("status", "--porcelain=v1", "--untracked-files=all")
+        output = self.status_porcelain()
         paths: set[str] = set()
         for line in output.splitlines():
             if len(line) < 4:

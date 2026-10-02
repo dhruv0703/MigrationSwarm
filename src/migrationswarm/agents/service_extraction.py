@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -107,6 +108,56 @@ class ExtractionWriteError(ServiceExtractionError):
     """Raised when generated files cannot be applied atomically."""
 
 
+def _dirty_worktree_message(repository: GitRepository, workspace: TaskWorkspace) -> str:
+    """Describe every relevant Git status category without relaxing cleanliness."""
+    porcelain = repository.status_porcelain()
+    ignored_status = repository.status_porcelain(include_ignored=True)
+    entries = [line for line in ignored_status.splitlines() if len(line) >= 4]
+    tracked_modified: list[str] = []
+    staged: list[str] = []
+    untracked: list[str] = []
+    ignored: list[str] = []
+    for line in entries:
+        index_status, worktree_status = line[0], line[1]
+        path = line[3:]
+        if line[:2] == "??":
+            untracked.append(path)
+        elif line[:2] == "!!":
+            ignored.append(path)
+        else:
+            tracked_modified.append(path)
+            if index_status != " ":
+                staged.append(path)
+            if worktree_status != " ":
+                tracked_modified.append(path)
+    return (
+        "Extraction worktree must be clean at the start; "
+        f"worktree_path={workspace.workspace_path}; "
+        f"starting_commit={workspace.base_commit}; "
+        f"current_commit={repository.head_commit()}; "
+        f"git_status_porcelain={porcelain.strip() or '<clean>'!r}; "
+        f"tracked_modified={sorted(set(tracked_modified))!r}; "
+        f"staged={sorted(set(staged))!r}; "
+        f"untracked={sorted(set(untracked))!r}; "
+        f"ignored={sorted(set(ignored))!r}"
+    )
+
+
+def _evidence_root(context: AgentContext, workspace: TaskWorkspace) -> Path:
+    """Resolve optional read-only evidence from the main repository metadata root."""
+    raw_root = context.metadata.get("evidence_root")
+    if raw_root is None:
+        return workspace.workspace_path
+    if not isinstance(raw_root, str) or not raw_root.strip():
+        raise ExtractionEvidenceError("evidence_root must be a non-empty path")
+    candidate = Path(raw_root).expanduser().resolve()
+    if candidate != workspace.repository_root.expanduser().resolve():
+        raise ExtractionEvidenceError(
+            "evidence_root must be the managed worktree's repository root"
+        )
+    return candidate
+
+
 class ExtractionDependencyKind(StrEnum):
     """Deterministic classification for dependencies outside the candidate."""
 
@@ -120,12 +171,16 @@ class ExtractionDependencyKind(StrEnum):
 
 
 class ExtractionLimits(BaseModel):
-    """Bounds on model context and generated service size."""
+    """Fixed bounds on model context and generated service size."""
 
     model_config = ConfigDict(extra="forbid")
 
     target_root: str = DEFAULT_TARGET_ROOT
-    max_context_files: int = Field(default=8, ge=1)
+    max_context_files: int = Field(
+        default=16,
+        ge=1,
+        description="Fixed extraction context ceiling; required files are never truncated.",
+    )
     max_context_bytes_per_file: int = Field(default=16_000, ge=1)
     max_total_context_bytes: int = Field(default=60_000, ge=1)
     max_generated_files: int = Field(default=20, ge=1)
@@ -173,6 +228,19 @@ class ExtractionSourceFile(BaseModel):
     content: str = Field(min_length=1)
 
 
+class ExtractionContextSelection(BaseModel):
+    """Deterministic accounting for files selected for extraction context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    required_file_count: int = Field(ge=0)
+    optional_file_count: int = Field(ge=0)
+    selected_file_count: int = Field(ge=0)
+    configured_limit: int = Field(ge=1)
+    selected_files_by_reason: dict[str, list[str]] = Field(default_factory=dict)
+    excluded_files_by_reason: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class ServiceExtractionContext(BaseModel):
     """Strict, bounded context sent to the coding model."""
 
@@ -187,6 +255,7 @@ class ServiceExtractionContext(BaseModel):
     acceptance_criteria: list[str] = Field(min_length=1)
     target_service_directory: str = Field(min_length=1)
     warnings: list[ExtractionWarning] = Field(default_factory=list)
+    context_selection: ExtractionContextSelection
 
     @property
     def context_bytes(self) -> int:
@@ -279,7 +348,7 @@ Return only strict JSON:
         workspace = self._require_workspace(task, context)
         repository = GitRepository(workspace.workspace_path)
         if repository.is_dirty():
-            raise ExtractionWorkspaceError("Extraction worktree must be clean at the start")
+            raise ExtractionWorkspaceError(_dirty_worktree_message(repository, workspace))
         extraction_context = self.build_context(task, context, workspace)
         proposal, response = self._propose(extraction_context)
         normalized = self._validate_proposal(proposal, extraction_context, workspace)
@@ -320,7 +389,8 @@ Return only strict JSON:
         started_at = datetime.now(UTC)
         workspace = self._require_workspace(task, context)
         if GitRepository(workspace.workspace_path).is_dirty():
-            raise ExtractionWorkspaceError("Extraction worktree must be clean at the start")
+            repository = GitRepository(workspace.workspace_path)
+            raise ExtractionWorkspaceError(_dirty_worktree_message(repository, workspace))
         extraction_context = self.build_context(task, context, workspace)
         return AgentResult(
             task_id=task.id,
@@ -358,23 +428,31 @@ Return only strict JSON:
                 "ServiceExtractionAgent requires metadata.service_name"
             )
         root = managed_workspace.workspace_path
+        evidence_root = _evidence_root(context, managed_workspace)
         boundary = self._load_artifact(
-            root / SERVICE_BOUNDARIES_JSON_ARTIFACT, ServiceBoundaryReport
+            evidence_root / SERVICE_BOUNDARIES_JSON_ARTIFACT, ServiceBoundaryReport
         )
         candidate = _select_candidate(boundary, service_name)
         if candidate is None:
             raise SelectedServiceNotFoundError(
                 f"Selected candidate service is not present in boundary evidence: {service_name}"
             )
-        plan = self._load_artifact(root / MIGRATION_PLAN_JSON_ARTIFACT, MigrationPlan)
+        plan_payload = context.metadata.get("migration_plan")
+        plan = (
+            MigrationPlan.model_validate(plan_payload)
+            if isinstance(plan_payload, dict)
+            else self._load_artifact(evidence_root / MIGRATION_PLAN_JSON_ARTIFACT, MigrationPlan)
+        )
         if _select_candidate_name(plan.candidate_service) != _select_candidate_name(candidate.name):
             raise ExtractionEvidenceError(
                 "Migration plan candidate does not match selected service: "
                 f"{plan.candidate_service}"
             )
-        graph = self._load_artifact(root / JAVA_DEPENDENCY_ARTIFACT, JavaDependencyGraph)
+        graph = self._load_artifact(
+            evidence_root / JAVA_DEPENDENCY_ARTIFACT, JavaDependencyGraph
+        )
         architecture = self._load_artifact(
-            root / ARCHITECTURE_REPORT_ARTIFACT, ArchitectureReport
+            evidence_root / ARCHITECTURE_REPORT_ARTIFACT, ArchitectureReport
         )
         classes_by_name = {
             java_class.fully_qualified_name: java_class for java_class in graph.classes
@@ -388,9 +466,13 @@ Return only strict JSON:
                 )
             selected_classes.append(java_class)
 
+        context_classes, context_selection = _select_context_classes(
+            candidate, graph, boundary, classes_by_name, self.limits
+        )
+        required_names = set(candidate.classes)
         source_files: list[ExtractionSourceFile] = []
         total_bytes = 0
-        for java_class in sorted(selected_classes, key=lambda item: item.fully_qualified_name):
+        for java_class in context_classes:
             source_path = _safe_workspace_path(java_class.file_path, root)
             if not source_path.is_file():
                 raise ExtractionEvidenceError(
@@ -399,12 +481,26 @@ Return only strict JSON:
             content = source_path.read_text(encoding="utf-8")
             byte_count = len(content.encode("utf-8"))
             if byte_count > self.limits.max_context_bytes_per_file:
+                if java_class.fully_qualified_name not in required_names:
+                    _exclude_selected_file(
+                        context_selection,
+                        java_class.file_path,
+                        "optional_file_exceeds_per_file_limit",
+                    )
+                    continue
                 raise ExtractionEvidenceError(
                     f"Selected source file exceeds context limit: {java_class.file_path}"
                 )
-            total_bytes += byte_count
-            if total_bytes > self.limits.max_total_context_bytes:
+            if total_bytes + byte_count > self.limits.max_total_context_bytes:
+                if java_class.fully_qualified_name not in required_names:
+                    _exclude_selected_file(
+                        context_selection,
+                        java_class.file_path,
+                        "optional_file_exceeds_total_byte_limit",
+                    )
+                    continue
                 raise ExtractionEvidenceError("Selected source context exceeds total byte limit")
+            total_bytes += byte_count
             source_files.append(
                 ExtractionSourceFile(
                     class_name=java_class.fully_qualified_name,
@@ -414,8 +510,6 @@ Return only strict JSON:
                     content=content,
                 )
             )
-        if len(source_files) > self.limits.max_context_files:
-            raise ExtractionEvidenceError("Selected source context exceeds file count limit")
 
         selected_names = {item.fully_qualified_name for item in selected_classes}
         shared_names = {item.class_name for item in boundary.shared_components}
@@ -451,6 +545,7 @@ Return only strict JSON:
             acceptance_criteria=criteria,
             target_service_directory=target_directory,
             warnings=warnings,
+            context_selection=context_selection,
         )
 
     def _propose(
@@ -882,6 +977,197 @@ def _validate_java_package(
     return {f"{package_match.group(1)}.{declared_type}" for declared_type in declared_types}
 
 
+_CONTEXT_REASON_ORDER: tuple[str, ...] = (
+    "required_candidate_owned",
+    "direct_compile_dependency",
+    "required_shared_type",
+    "candidate_configuration_or_resource",
+    "candidate_test",
+)
+
+
+def _select_context_classes(
+    candidate: CandidateService,
+    graph: JavaDependencyGraph,
+    boundary: ServiceBoundaryReport,
+    classes_by_name: Mapping[str, JavaClass],
+    limits: ExtractionLimits,
+) -> tuple[list[JavaClass], ExtractionContextSelection]:
+    """Select required and directly useful source files deterministically.
+
+    Candidate classes are required and are never truncated. Optional context is
+    restricted to one dependency edge from those classes and is ranked by
+    evidence strength before the remaining file budget is applied.
+    """
+    required_names = set(candidate.classes)
+    missing = sorted(required_names - set(classes_by_name))
+    if missing:
+        raise ExtractionEvidenceError(
+            "Selected candidate classes are missing from dependency evidence: "
+            + ", ".join(missing)
+        )
+
+    required_classes = sorted(
+        (classes_by_name[name] for name in required_names),
+        key=lambda item: item.fully_qualified_name,
+    )
+    selected_by_reason: dict[str, list[str]] = {
+        reason: [] for reason in _CONTEXT_REASON_ORDER
+    }
+    selected_by_reason["required_candidate_owned"] = [
+        item.file_path for item in required_classes
+    ]
+    direct_edges = [
+        edge
+        for edge in graph.dependencies
+        if edge.source in required_names
+        and edge.target not in required_names
+        and edge.target in classes_by_name
+    ]
+    edge_counts = Counter(edge.target for edge in direct_edges)
+    direct_targets = set(edge_counts)
+    shared_names = {item.class_name for item in boundary.shared_components}
+    optional_names = sorted(direct_targets)
+    categorized: dict[str, list[JavaClass]] = {reason: [] for reason in _CONTEXT_REASON_ORDER[1:]}
+    for name in optional_names:
+        java_class = classes_by_name[name]
+        normalized_path = java_class.file_path.replace("\\", "/")
+        if name in shared_names:
+            reason = "required_shared_type"
+        elif java_class.role is JavaClassRole.CONFIGURATION:
+            reason = "candidate_configuration_or_resource"
+        elif "/src/test/" in normalized_path:
+            reason = "candidate_test"
+        else:
+            reason = "direct_compile_dependency"
+        categorized[reason].append(java_class)
+
+    for classes in categorized.values():
+        classes.sort(key=lambda item: _context_rank(item, edge_counts, required_classes))
+
+    optional_classes = [
+        item for reason in _CONTEXT_REASON_ORDER[1:] for item in categorized[reason]
+    ]
+    capacity = max(0, limits.max_context_files - len(required_classes))
+    selected_optional = optional_classes[:capacity]
+    for reason in _CONTEXT_REASON_ORDER[1:]:
+        paths = [
+            item.file_path
+            for item in selected_optional
+            if _context_reason(item, categorized) == reason
+        ]
+        selected_by_reason[reason] = sorted(paths)
+
+    transitive_names = {
+        edge.target
+        for edge in graph.dependencies
+        if edge.source in direct_targets and edge.target not in required_names
+    }
+    excluded_by_reason: dict[str, list[str]] = {}
+    selected_optional_names = {item.fully_qualified_name for item in selected_optional}
+    for item in optional_classes:
+        if item.fully_qualified_name not in selected_optional_names:
+            excluded_by_reason.setdefault("optional_context_limit", []).append(item.file_path)
+    for item in sorted(classes_by_name.values(), key=lambda value: value.fully_qualified_name):
+        if (
+            item.fully_qualified_name in required_names
+            or item.fully_qualified_name in direct_targets
+        ):
+            continue
+        if item.fully_qualified_name in transitive_names:
+            excluded_by_reason.setdefault("transitive_dependency", []).append(item.file_path)
+
+    for values in selected_by_reason.values():
+        values.sort()
+    for values in excluded_by_reason.values():
+        values.sort()
+    selection = ExtractionContextSelection(
+        required_file_count=len(required_classes),
+        optional_file_count=len(optional_classes),
+        selected_file_count=len(required_classes) + len(selected_optional),
+        configured_limit=limits.max_context_files,
+        selected_files_by_reason=selected_by_reason,
+        excluded_files_by_reason=excluded_by_reason,
+    )
+    if selection.required_file_count > limits.max_context_files:
+        raise ExtractionEvidenceError(_context_file_limit_message(candidate, selection))
+    ordered_classes = required_classes + selected_optional
+    return ordered_classes, selection
+
+
+def _context_rank(
+    java_class: JavaClass,
+    edge_counts: Counter[str],
+    required_classes: list[JavaClass],
+) -> tuple[int, int, str]:
+    """Rank optional files by edge frequency, package distance, then name."""
+    candidate_packages = [item.package for item in required_classes]
+    distance = min(
+        _package_distance(package, java_class.package) for package in candidate_packages
+    )
+    return (
+        -edge_counts[java_class.fully_qualified_name],
+        distance,
+        java_class.fully_qualified_name,
+    )
+
+
+def _package_distance(left: str, right: str) -> int:
+    """Return a stable segment distance between two Java packages."""
+    left_parts = left.split(".")
+    right_parts = right.split(".")
+    common = 0
+    for left_part, right_part in zip(left_parts, right_parts, strict=False):
+        if left_part != right_part:
+            break
+        common += 1
+    return len(left_parts) + len(right_parts) - (2 * common)
+
+
+def _context_reason(
+    java_class: JavaClass,
+    categorized: Mapping[str, list[JavaClass]],
+) -> str:
+    """Return the deterministic reason assigned to one optional class."""
+    for reason, values in categorized.items():
+        if any(item.fully_qualified_name == java_class.fully_qualified_name for item in values):
+            return reason
+    raise AssertionError(
+        f"Uncategorized extraction context class: {java_class.fully_qualified_name}"
+    )
+
+
+def _exclude_selected_file(
+    selection: ExtractionContextSelection,
+    relative_path: str,
+    reason: str,
+) -> None:
+    """Move an optional selected path into deterministic exclusion diagnostics."""
+    for paths in selection.selected_files_by_reason.values():
+        if relative_path in paths:
+            paths.remove(relative_path)
+            break
+    selection.excluded_files_by_reason.setdefault(reason, []).append(relative_path)
+    selection.excluded_files_by_reason[reason].sort()
+    selection.selected_file_count -= 1
+
+
+def _context_file_limit_message(
+    candidate: CandidateService,
+    selection: ExtractionContextSelection,
+) -> str:
+    """Format an actionable required-file overflow diagnostic."""
+    details = json.dumps(selection.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return (
+        "Selected source context exceeds file count limit: "
+        f"candidate={candidate.name}; required files cannot be truncated; "
+        f"required_file_count={selection.required_file_count}; "
+        f"optional_file_count={selection.optional_file_count}; "
+        f"selected_file_count={selection.selected_file_count}; "
+        f"configured_limit={selection.configured_limit}; selection={details}"
+    )
+
+
 def _external_dependencies(
     graph: JavaDependencyGraph,
     selected_names: set[str],
@@ -943,6 +1229,7 @@ __all__ = [
     "EXTRACTION_RESULTS_DIR",
     "ExtractionDependency",
     "ExtractionDependencyKind",
+    "ExtractionContextSelection",
     "ExtractionEvidenceError",
     "ExtractionLimits",
     "ExtractionResponseError",

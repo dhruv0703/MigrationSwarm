@@ -19,8 +19,10 @@ from migrationswarm.core.models import (
     ModelRole,
 )
 from migrationswarm.demo import (
+    DemoError,
     DemoResult,
     RecordingRouter,
+    _initialize_git_repository,
     _select_demo_services,
     _set_demo_approvals,
     run_demo,
@@ -134,6 +136,64 @@ def test_live_candidate_names_are_preserved_for_demo_domains() -> None:
     ]
 
 
+def test_generic_demo_accepts_arbitrary_validated_candidates() -> None:
+    report = ServiceBoundaryReport(
+        candidate_services=[
+            CandidateService(
+                name=name,
+                description=f"{name} domain",
+                classes=[f"example.{name}"],
+                packages=[],
+                controllers=[],
+                services=[],
+                repositories=[],
+                confidence=0.8,
+                reasoning="grounded",
+                dependencies_on_other_candidates=[],
+                risks=[],
+            )
+            for name in ("Vet", "Owner", "System")
+        ],
+        shared_components=[],
+        unresolved_classes=[],
+        overall_reasoning="grounded",
+        warnings=[],
+        model_provider="test",
+        model_name="test",
+    )
+
+    assert _select_demo_services(report, ()) == ["Vet", "Owner", "System"]
+
+
+def test_fixture_selection_remains_strict_for_expected_domains() -> None:
+    report = ServiceBoundaryReport(
+        candidate_services=[
+            CandidateService(
+                name="Inventory",
+                description="inventory",
+                classes=["example.Inventory"],
+                packages=[],
+                controllers=[],
+                services=[],
+                repositories=[],
+                confidence=0.8,
+                reasoning="grounded",
+                dependencies_on_other_candidates=[],
+                risks=[],
+            )
+        ],
+        shared_components=[],
+        unresolved_classes=[],
+        overall_reasoning="grounded",
+        warnings=[],
+        model_provider="test",
+        model_name="test",
+    )
+
+    with pytest.raises(DemoError, match="required fixture domains"):
+        _select_demo_services(report, ("Inventory", "Orders", "Notifications"))
+
+
 def test_demo_approvals_replace_stale_candidate_names(tmp_path: Path) -> None:
     approvals = tmp_path / ".migrationswarm" / "service-approvals.json"
     approvals.parent.mkdir()
@@ -156,6 +216,25 @@ def test_demo_approvals_replace_stale_candidate_names(tmp_path: Path) -> None:
         '  ]\n'
         '}\n'
     )
+
+
+def test_demo_staging_ignores_runtime_metadata_with_existing_gitignore(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / ".gitignore").write_text("target/\n", encoding="utf-8")
+
+    _initialize_git_repository(staging)
+    (staging / ".migrationswarm" / "runtime.json").parent.mkdir()
+    (staging / ".migrationswarm" / "runtime.json").write_text("{}\n", encoding="utf-8")
+
+    assert ".migrationswarm/" in (staging / ".gitignore").read_text(encoding="utf-8")
+    assert "!! .migrationswarm/" in subprocess.run(
+        ["git", "status", "--porcelain=v1", "--ignored=matching"],
+        cwd=staging,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
 
 
 def test_recording_router_paces_live_model_calls(

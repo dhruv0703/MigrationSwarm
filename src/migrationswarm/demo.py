@@ -459,7 +459,10 @@ def run_demo(
         boundaries = ServiceBoundaryReport.model_validate(
             boundary_result.metadata["service_boundary_report"]
         )
-        selected_services = _select_demo_services(boundaries, fixture.expected_services)
+        expected_services = fixture.expected_services
+        if live_mode and not (source / "benchmark.json").is_file():
+            expected_services = ()
+        selected_services = _select_demo_services(boundaries, expected_services)
         _set_demo_approvals(source, selected_services)
         plans: dict[str, MigrationPlan] = {}
         for service in selected_services:
@@ -600,7 +603,13 @@ def _select_demo_services(
     boundaries: ServiceBoundaryReport,
     expected_services: tuple[str, ...] = DEMO_SERVICES,
 ) -> list[str]:
-    """Select declared fixture domains while preserving candidate display names."""
+    """Select fixture domains or all validated candidates for a generic repository."""
+    if not expected_services:
+        selected_names = [candidate.name for candidate in boundaries.candidate_services]
+        if not selected_names:
+            raise DemoError("Boundary proposal did not contain any candidate services")
+        return selected_names
+
     selected: dict[str, str] = {}
     for candidate in boundaries.candidate_services:
         canonical = _match_expected_service(candidate.name, expected_services)
@@ -1197,11 +1206,17 @@ def _service_pom(slug: str) -> str:
 
 def _initialize_git_repository(root: Path) -> None:
     # Benchmark fixtures are intentionally source-only, but the managed worktree
-    # writes ignored evidence and Maven output during orchestration.  Ensure every
-    # fixture receives the same generated-state policy as the commerce fixture.
+    # keeps runtime evidence and Maven output outside tracked source state. Ensure
+    # every temporary staging repository receives the same generated-state policy.
     ignore_file = root / ".gitignore"
-    if not ignore_file.exists():
-        ignore_file.write_text("target/\n.migrationswarm/\n", encoding="utf-8")
+    existing = ignore_file.read_text(encoding="utf-8") if ignore_file.exists() else ""
+    lines = existing.splitlines()
+    if not any(line.strip().lstrip("/") == ".migrationswarm/" for line in lines):
+        suffix = "\n" if existing and not existing.endswith(("\n", "\r")) else ""
+        ignore_file.write_text(
+            existing + suffix + ".migrationswarm/\n",
+            encoding="utf-8",
+        )
     commands = [
         ["git", "init"],
         ["git", "config", "user.name", "MigrationSwarm Demo"],

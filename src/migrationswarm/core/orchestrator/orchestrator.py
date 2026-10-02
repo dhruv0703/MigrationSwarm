@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid5
@@ -76,14 +75,6 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 RUNS_DIR = ".migrationswarm/runs"
-_EVIDENCE_ARTIFACTS = (
-    SERVICE_BOUNDARIES_JSON_ARTIFACT,
-    MIGRATION_PLAN_JSON_ARTIFACT,
-    JAVA_DEPENDENCY_ARTIFACT,
-    ARCHITECTURE_REPORT_ARTIFACT,
-)
-
-
 class MigrationOrchestrator:
     """Coordinate existing task, extraction, build, and decision components."""
 
@@ -163,8 +154,6 @@ class MigrationOrchestrator:
                 {"reused": reused},
             )
             self._persist_run(run, task)
-            self._stage_evidence(repository.root, workspace, plan=plan)
-
             run.status = MigrationRunStatus.EXTRACTING
             run.current_stage = "extracting"
             run.record(
@@ -174,7 +163,9 @@ class MigrationOrchestrator:
             )
             self._persist_run(run, task)
             with self._measure("task_execution"):
-                extraction_result = self._execute_extraction(task, workspace, candidate.name)
+                extraction_result = self._execute_extraction(
+                    task, workspace, candidate.name, plan
+                )
             extraction_data = extraction_result.metadata.get("extraction_result", {})
             generated_files = extraction_data.get("changed_files", [])
             run.generated_files = [str(path) for path in generated_files]
@@ -414,6 +405,7 @@ class MigrationOrchestrator:
         task: Task,
         workspace: TaskWorkspace,
         service_name: str,
+        plan: MigrationPlan,
     ) -> Any:
         """Run extraction through TaskScheduler, AgentRegistry, and WorkerRuntime."""
         extraction_agent = self.extraction_agent or ServiceExtractionAgent()
@@ -426,7 +418,11 @@ class MigrationOrchestrator:
             project_id=task.project_id,
             task=task,
             workspace_path=str(workspace.workspace_path),
-            metadata={"service_name": service_name},
+            metadata={
+                "service_name": service_name,
+                "evidence_root": str(workspace.repository_root),
+                "migration_plan": plan.model_dump(mode="json"),
+            },
         )
         result = WorkerRuntime(scheduler, registry).execute(task, context)
         if self.state_service is not None:
@@ -528,30 +524,6 @@ class MigrationOrchestrator:
         except UnknownWorktreeError:
             worktree = manager.create_worktree(task)
             return manager.task_workspace(worktree.task_id), False
-
-    @staticmethod
-    def _stage_evidence(
-        repository_root: Path,
-        workspace: TaskWorkspace,
-        *,
-        plan: MigrationPlan | None = None,
-    ) -> None:
-        """Make required ignored metadata available inside the new worktree."""
-        for relative in _EVIDENCE_ARTIFACTS:
-            source = repository_root / relative
-            if relative == MIGRATION_PLAN_JSON_ARTIFACT and plan is not None:
-                target = workspace.workspace_path / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(
-                    json.dumps(plan.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-                continue
-            if not source.is_file():
-                raise MigrationRunError(f"Required migration evidence is missing: {relative}")
-            target = workspace.workspace_path / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
 
     @staticmethod
     def _validate_inputs(

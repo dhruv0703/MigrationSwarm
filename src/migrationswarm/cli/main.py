@@ -1123,7 +1123,7 @@ def extract_service(
             project_id=task.project_id,
             task=task,
             workspace_path=str(workspace.workspace_path),
-            metadata={"service_name": service},
+            metadata={"service_name": service, "evidence_root": str(path.resolve())},
         )
         result = agent.dry_run(task, context) if dry_run else agent.execute(task, context)
     except (GitRepositoryError, ServiceExtractionError, ModelProviderError) as error:

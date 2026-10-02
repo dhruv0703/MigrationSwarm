@@ -28,7 +28,9 @@ from migrationswarm.agents.service_boundary import (
     SERVICE_BOUNDARIES_MARKDOWN_ARTIFACT,
     BoundaryResponseError,
     ServiceBoundaryAgent,
+    _allowed_candidate_dependencies,
     _deterministic_candidates,
+    _required_classes_by_candidate,
 )
 from migrationswarm.cli.main import app
 from migrationswarm.core.agents import AgentContext, AgentResult
@@ -500,6 +502,10 @@ def test_unsupported_candidate_dependency_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(BoundaryResponseError, match="one repair attempt"):
         run_agent(tmp_path, router)
+    repair_content = router.requests[1].messages[-1].content
+    assert "deterministic allowlist" in repair_content
+    assert "[]" in repair_content
+    assert "Candidate dependency is not supported by Java dependency evidence" in repair_content
 
 
 def test_artifacts_include_json_and_concise_markdown(tmp_path: Path) -> None:
@@ -833,6 +839,11 @@ def test_nested_internal_package_merges_into_parent_module() -> None:
     assert [item["name"] for item in candidates] == ["Orders"]
     assert candidates[0]["merged_packages"] == ["com.example.orders.internal"]
     assert set(evidence["candidate_components"][1]["classes"]) <= set(candidates[0]["classes"])
+    required = _required_classes_by_candidate(evidence)
+    assert required[0]["merged_classes"] == sorted(
+        evidence["candidate_components"][1]["classes"]
+    )
+    assert set(required[0]["merged_classes"]) <= set(required[0]["required_classes"])
 
 
 def test_multiple_modules_merge_their_internal_packages_independently() -> None:
@@ -845,6 +856,47 @@ def test_multiple_modules_merge_their_internal_packages_independently() -> None:
 
     assert [item["name"] for item in candidates] == ["Billing", "Orders"]
     assert all(item["merged_packages"] for item in candidates)
+
+
+def test_merged_internal_classes_contribute_to_allowed_candidate_edges() -> None:
+    orders = _implementation_component("com.example.orders.internal", "Order")
+    billing = _implementation_component("com.example.billing.internal", "Billing")
+    evidence = _implementation_evidence(orders, billing)
+    evidence["dependencies"] = [
+        {
+            "source": orders["classes"][1],
+            "target": billing["classes"][1],
+            "relationship": "FIELD_DEPENDENCY",
+        }
+    ]
+
+    assert _allowed_candidate_dependencies(evidence) == [
+        {"source": "Orders", "target": "Billing"}
+    ]
+
+
+def test_supported_candidate_dependency_is_accepted_and_explicitly_allowed(
+    tmp_path: Path,
+) -> None:
+    write_commerce_evidence(tmp_path)
+    output = commerce_output()
+    router = FakeRouter([json.dumps(output)])
+    result = run_agent(tmp_path, router)
+
+    assert result.success
+    request = router.requests[0].messages[1].content
+    assert '"allowed_candidate_dependencies"' in request
+    assert '"source":"Orders"' in request
+    assert '"target":"Inventory"' in request
+
+
+def test_empty_allowed_dependency_set_is_explicit_in_prompt(tmp_path: Path) -> None:
+    write_evidence(tmp_path)
+    router = FakeRouter([json.dumps(valid_output())])
+    run_agent(tmp_path, router)
+
+    request = router.requests[0].messages[1].content
+    assert '"allowed_candidate_dependencies":[]' in request
 
 
 def test_top_level_internal_package_remains_a_domain_candidate() -> None:
@@ -991,13 +1043,34 @@ def test_grounded_exclusion_and_silent_exclusion_behavior(tmp_path: Path) -> Non
 def test_missing_class_coverage_is_rejected(tmp_path: Path) -> None:
     """A candidate that omits an architecture-relevant DTO is incomplete."""
     domains = _commerce_domains()
+    missing_class = domains["Inventory"][-1]
     candidates = [
         commerce_candidate(name, classes[:-1] if name == "Inventory" else classes)
         for name, classes in domains.items()
     ]
     output = commerce_output(candidate_services=candidates)
+    write_commerce_evidence(tmp_path)
+    router = FakeRouter([json.dumps(output), json.dumps(output)])
     with pytest.raises(BoundaryResponseError, match="INCOMPLETE_BOUNDARY_COVERAGE"):
-        run_commerce_output(tmp_path, [output, output])
+        run_agent(tmp_path, router)
+    assert missing_class in str(router.requests[1].messages[-1].content)
+    assert "required_classes_by_candidate" in router.requests[1].messages[-1].content
+
+
+def test_candidate_cannot_claim_classes_owned_by_another_candidate(tmp_path: Path) -> None:
+    """Deterministic ownership cannot be bypassed by swapping candidate classes."""
+    domains = _commerce_domains()
+    candidates = [
+        commerce_candidate("Inventory", domains["Orders"]),
+        commerce_candidate("Orders", domains["Inventory"]),
+        commerce_candidate("Notifications", domains["Notifications"]),
+        commerce_candidate("Customers", domains["Customers"]),
+    ]
+    output = commerce_output(candidate_services=candidates)
+    write_commerce_evidence(tmp_path)
+    content = json.dumps(output)
+    with pytest.raises(BoundaryResponseError, match="missing class assignments"):
+        run_agent(tmp_path, FakeRouter([content, content]))
 
 
 def test_infrastructure_and_test_classes_need_not_be_services(tmp_path: Path) -> None:
@@ -1079,6 +1152,8 @@ def test_coverage_request_is_compact_and_secret_free(tmp_path: Path) -> None:
     run_agent(tmp_path, router)
     request = router.requests[0].messages[1].content
     assert "candidate_domains" in request
+    assert '"required_classes_by_candidate"' in request
+    assert all(class_name in request for class_name in _commerce_domains()["Inventory"])
     assert "prompt" not in request.casefold()
     assert "api_key" not in request.casefold()
     assert "public class" not in request

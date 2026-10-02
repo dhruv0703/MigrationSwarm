@@ -244,6 +244,7 @@ def test_successful_complete_migration_pipeline(
     assert result.run.worktree_path is not None
     worktree = result.run.worktree_path
     assert (worktree / "services/greeting-service/pom.xml").is_file()
+    assert not (worktree / ".migrationswarm").exists()
     assert result.verification_result is not None
     assert result.verification_result.status is VerificationStatus.PASSED
     assert calls[0]["cwd"] == worktree / "services/greeting-service"

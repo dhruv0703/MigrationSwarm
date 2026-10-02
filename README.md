@@ -92,6 +92,8 @@ does not replace durable task state, and `VERIFYING` is not `COMPLETED`.
 - Path traversal and symlink escapes are rejected.
 - Shell execution is allowlisted, bounded, and uses `shell=False`.
 - Model responses, artifacts, and logs have explicit size limits.
+- Extraction context uses a fixed 16-file ceiling; required candidate files are
+  never truncated, and optional context is deterministically bounded.
 - Retries and repair attempts are finite; there are no invisible retries.
 - No automatic commit, push, reset, cleanup, or pull request is performed.
 - Cycles, foreign repository access, and cross-domain writes can require

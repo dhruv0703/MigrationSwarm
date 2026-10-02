@@ -169,7 +169,13 @@ cross-candidate dependency MUST be supported by at least one supplied dependency
 between classes assigned to those two candidates. You must account for every deterministic
 candidate/domain supplied in the evidence. A domain may be included, merged, shared, or
 explicitly excluded with a grounded reason, but it may not disappear silently. Explain
-uncertainty.
+uncertainty. Candidate dependencies are further restricted to the explicit
+allowed_candidate_dependencies set in the evidence. Emit only edges from that set;
+do not infer dependencies from names, domain intuition, controllers, or likely business
+interactions. If the set is empty, emit no candidate dependencies. For every candidate
+with INCLUDED or MERGED accounting, assign every class in the explicit
+required_classes_by_candidate mapping. Do not omit, invent, or move those classes;
+implementation classes merged into a parent remain owned by that parent candidate.
 
 Return ONLY JSON matching the requested schema:
 {
@@ -301,12 +307,16 @@ Return ONLY JSON matching the requested schema:
         return len(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
     def _propose(self, evidence: dict[str, Any]) -> ServiceBoundaryReport:
+        allowed_dependencies = _allowed_candidate_dependencies(evidence)
+        required_classes = _required_classes_by_candidate(evidence)
         request = self._request(evidence)
         try:
             response = self.router.generate(request)
             output = self._parse_and_ground(response.content, evidence)
         except (BoundaryResponseError, BoundaryGroundingError) as first_error:
-            repair_request = self._repair_request(request, str(first_error))
+            repair_request = self._repair_request(
+                request, str(first_error), allowed_dependencies, required_classes
+            )
             try:
                 repaired = self.router.generate(repair_request)
                 output = self._parse_and_ground(repaired.content, evidence)
@@ -367,11 +377,8 @@ Return ONLY JSON matching the requested schema:
                     )
 
         supported_dependencies = {
-            (assigned[source], assigned[target])
-            for edge in evidence["dependencies"]
-            if (source := edge["source"]) in assigned
-            and (target := edge["target"]) in assigned
-            and assigned[source] != assigned[target]
+            (item["source"], item["target"])
+            for item in _allowed_candidate_dependencies(evidence)
         }
         for candidate in output.candidate_services:
             for dependency in candidate.dependencies_on_other_candidates:
@@ -433,17 +440,23 @@ Return ONLY JSON matching the requested schema:
             source_classes = set(component["classes"])
             accounted_classes = set(accounting.classes) or source_classes
             if not source_classes <= accounted_classes:
+                omitted = sorted(source_classes - accounted_classes)
                 raise BoundaryGroundingError(
                     "INCOMPLETE_BOUNDARY_COVERAGE: accounting omits classes from "
-                    f"{name}"
+                    f"{name}: {', '.join(omitted)}"
                 )
 
             if accounting.disposition is BoundaryDisposition.INCLUDED:
                 target = candidate_by_name.get(_normal_name(name))
-                if target is None or not source_classes <= set(target.classes):
+                missing_classes = (
+                    sorted(source_classes - set(target.classes))
+                    if target is not None
+                    else sorted(source_classes)
+                )
+                if missing_classes:
                     raise BoundaryGroundingError(
                         "INCOMPLETE_BOUNDARY_COVERAGE: missing class assignments for "
-                        f"{name}"
+                        f"{name}: {', '.join(missing_classes)}"
                     )
             elif accounting.disposition is BoundaryDisposition.MERGED:
                 if not accounting.merged_into:
@@ -458,9 +471,10 @@ Return ONLY JSON matching the requested schema:
                         f"{name}: {accounting.merged_into}"
                     )
                 if not source_classes <= set(target.classes):
+                    missing_classes = sorted(source_classes - set(target.classes))
                     raise BoundaryGroundingError(
                         "INCOMPLETE_BOUNDARY_COVERAGE: merged source classes disappear for "
-                        f"{name}"
+                        f"{name}: {', '.join(missing_classes)}"
                     )
                 target_classes = set(target.classes) - source_classes
                 if not _has_grouping_evidence(source_classes, target_classes, evidence):
@@ -537,12 +551,15 @@ Return ONLY JSON matching the requested schema:
                 for item in evidence["classes"]
             ],
             "dependencies": evidence.get("dependencies", []),
+            "allowed_candidate_dependencies": _allowed_candidate_dependencies(evidence),
+            "required_classes_by_candidate": _required_classes_by_candidate(evidence),
             "candidate_domains": [
                 {
                     "name": item["name"],
                     "classes": item["classes"],
                     "packages": item["packages"],
                     "merged_packages": item.get("merged_packages", []),
+                    "merged_classes": item.get("merged_classes", []),
                     "controller_count": item["controller_count"],
                     "service_count": item["service_count"],
                     "repository_count": item["repository_count"],
@@ -563,7 +580,18 @@ Return ONLY JSON matching the requested schema:
         }
 
     @staticmethod
-    def _repair_request(request: ModelRequest, invalid_output: str) -> ModelRequest:
+    def _repair_request(
+        request: ModelRequest,
+        invalid_output: str,
+        allowed_dependencies: list[dict[str, str]],
+        required_classes: list[dict[str, Any]],
+    ) -> ModelRequest:
+        allowed_json = json.dumps(
+            allowed_dependencies, sort_keys=True, separators=(",", ":")
+        )
+        required_classes_json = json.dumps(
+            required_classes, sort_keys=True, separators=(",", ":")
+        )
         return request.model_copy(
             update={
                 "messages": [
@@ -573,8 +601,20 @@ Return ONLY JSON matching the requested schema:
                         content=(
                             "Repair the following invalid response. Return only valid JSON "
                             "matching the requested schema. Account for every deterministic "
-                            "candidate and do not add classes or dependencies.\n"
-                            f"{invalid_output}"
+                            "candidate and do not add classes or dependencies. Candidate "
+                            "dependencies may use only this deterministic allowlist "
+                            "(source -> target):\n"
+                            f"{allowed_json}\n"
+                            "Remove or replace every unsupported emitted edge using only "
+                            "that allowlist. If it is empty, emit no candidate dependencies. "
+                            "Do not infer edges from names or domain intuition. The prior "
+                            "validation error was:\n"
+                            f"{invalid_output}\n"
+                            "Required deterministic required_classes_by_candidate "
+                            "ownership (candidate -> all required classes) is:\n"
+                            f"{required_classes_json}\n"
+                            "Assign every exact class named in the validation feedback "
+                            "to its deterministic candidate or grounded merge target.\n"
                         ),
                     ),
                 ]
@@ -689,6 +729,7 @@ def _deterministic_candidates(evidence: dict[str, Any]) -> list[dict[str, Any]]:
                 "classes": set(),
                 "packages": set(),
                 "merged_packages": set(),
+                "merged_classes": set(),
                 "controller_count": 0,
                 "service_count": 0,
                 "repository_count": 0,
@@ -698,6 +739,7 @@ def _deterministic_candidates(evidence: dict[str, Any]) -> list[dict[str, Any]]:
         group["packages"].update(packages)
         if group_key != primary_package:
             group["merged_packages"].add(primary_package)
+            group["merged_classes"].update(component.get("classes", []))
         for key in ("controller_count", "service_count", "repository_count"):
             group[key] += component.get(key, 0)
 
@@ -716,6 +758,11 @@ def _deterministic_candidates(evidence: dict[str, Any]) -> list[dict[str, Any]]:
         )
         if not classes:
             continue
+        merged_classes = sorted(
+            class_name
+            for class_name in component["merged_classes"]
+            if class_name in classes
+        )
         domain = package.rsplit(".", 1)[-1]
         if domain in {"", "example", "main"}:
             services = [
@@ -731,12 +778,51 @@ def _deterministic_candidates(evidence: dict[str, Any]) -> list[dict[str, Any]]:
                 "classes": classes,
                 "packages": sorted(packages),
                 "merged_packages": sorted(component["merged_packages"]),
+                "merged_classes": merged_classes,
                 "controller_count": component.get("controller_count", 0),
                 "service_count": component.get("service_count", 0),
                 "repository_count": component.get("repository_count", 0),
             }
         )
     return sorted(result, key=lambda item: item["name"])
+
+
+def _required_classes_by_candidate(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return deterministic class ownership required for complete boundary accounting."""
+    return [
+        {
+            "candidate": item["name"],
+            "required_classes": item["classes"],
+            "merged_classes": item.get("merged_classes", []),
+        }
+        for item in _deterministic_candidates(evidence)
+    ]
+
+
+def _allowed_candidate_dependencies(evidence: dict[str, Any]) -> list[dict[str, str]]:
+    """Return candidate edges directly supported by deterministic class edges.
+
+    Ownership comes from the deterministic candidate accounting above, which already
+    folds nested implementation packages into their structural parent.  Model-proposed
+    groupings cannot expand this set; an edge is allowed only when a supplied Java edge
+    crosses two distinct deterministic candidates.
+    """
+    class_to_candidate = {
+        class_name: candidate["name"]
+        for candidate in _deterministic_candidates(evidence)
+        for class_name in candidate["classes"]
+    }
+    allowed = {
+        (class_to_candidate[source], class_to_candidate[target])
+        for edge in evidence.get("dependencies", [])
+        if (source := edge.get("source")) in class_to_candidate
+        and (target := edge.get("target")) in class_to_candidate
+        and class_to_candidate[source] != class_to_candidate[target]
+    }
+    return [
+        {"source": source, "target": target}
+        for source, target in sorted(allowed)
+    ]
 
 
 def _common_package_prefix(packages: set[str]) -> str:

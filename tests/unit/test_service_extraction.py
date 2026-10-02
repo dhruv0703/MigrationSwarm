@@ -10,6 +10,14 @@ from uuid import UUID, uuid4
 import pytest
 from typer.testing import CliRunner
 
+from migrationswarm.agents.dependency_analysis import (
+    JavaClass,
+    JavaClassRole,
+    JavaDependency,
+    JavaDependencyGraph,
+    JavaDependencyRelationship,
+)
+from migrationswarm.agents.service_boundary import CandidateService, ServiceBoundaryReport
 from migrationswarm.agents.service_extraction import (
     ExtractionEvidenceError,
     ExtractionLimits,
@@ -18,11 +26,12 @@ from migrationswarm.agents.service_extraction import (
     ExtractionWorkspaceError,
     ServiceExtractionAgent,
     ServiceExtractionError,
+    _select_context_classes,
     service_slug,
 )
 from migrationswarm.cli.main import app
 from migrationswarm.core.agents import AgentContext, AgentRegistry, WorkerRuntime
-from migrationswarm.core.git import GitWorktreeManager
+from migrationswarm.core.git import GitRepository, GitWorktreeManager
 from migrationswarm.core.models import ModelRequest, ModelResponse
 from migrationswarm.core.scheduler import TaskGraph, TaskScheduler
 from migrationswarm.core.tasks import Task, TaskStatus, TaskType
@@ -232,6 +241,83 @@ def test_workspace_outside_managed_root_is_rejected(
         ServiceExtractionAgent(FakeRouter([])).execute(task, make_context(task, outside))
 
 
+def test_fresh_extraction_worktree_is_clean(
+    extraction_task: tuple[Path, Task, Path],
+) -> None:
+    _, _, workspace = extraction_task
+    repository = GitRepository(workspace)
+
+    assert repository.status_porcelain() == ""
+    assert not repository.is_dirty()
+
+
+def test_modified_tracked_file_reports_clean_start_diagnostics(
+    extraction_task: tuple[Path, Task, Path],
+) -> None:
+    _, task, workspace = extraction_task
+    path = workspace / "src/main/java/com/example/monolith/GreetingService.java"
+    path.write_text(path.read_text(encoding="utf-8") + "// changed\n", encoding="utf-8")
+
+    with pytest.raises(ExtractionWorkspaceError) as error:
+        ServiceExtractionAgent(FakeRouter([])).execute(task, make_context(task, workspace))
+
+    message = str(error.value)
+    assert "git_status_porcelain=" in message
+    assert "tracked_modified=" in message
+    assert "staged=[]" in message
+    assert "untracked=[]" in message
+    assert "GreetingService.java" in message
+    assert "worktree_path=" in message
+    assert "starting_commit=" in message
+
+
+def test_staged_file_reports_staged_clean_start_diagnostics(
+    extraction_task: tuple[Path, Task, Path],
+) -> None:
+    _, task, workspace = extraction_task
+    relative = Path("src/main/java/com/example/monolith/GreetingService.java")
+    path = workspace / relative
+    path.write_text(path.read_text(encoding="utf-8") + "// staged\n", encoding="utf-8")
+    git(workspace, "add", relative.as_posix())
+
+    with pytest.raises(ExtractionWorkspaceError) as error:
+        ServiceExtractionAgent(FakeRouter([])).execute(task, make_context(task, workspace))
+
+    message = str(error.value)
+    assert "staged=['src/main/java/com/example/monolith/GreetingService.java']" in message
+
+
+def test_untracked_file_reports_untracked_clean_start_diagnostics(
+    extraction_task: tuple[Path, Task, Path],
+) -> None:
+    _, task, workspace = extraction_task
+    (workspace / "unexpected-runtime-file.txt").write_text("unexpected\n", encoding="utf-8")
+
+    with pytest.raises(ExtractionWorkspaceError) as error:
+        ServiceExtractionAgent(FakeRouter([])).execute(task, make_context(task, workspace))
+
+    message = str(error.value)
+    assert "untracked=['unexpected-runtime-file.txt']" in message
+
+
+def test_ignored_generated_file_does_not_fail_clean_start(
+    extraction_task: tuple[Path, Task, Path],
+) -> None:
+    _, task, workspace = extraction_task
+    exclude = Path(git(workspace, "rev-parse", "--git-path", "info/exclude"))
+    if not exclude.is_absolute():
+        exclude = workspace / exclude
+    exclude.write_text(exclude.read_text(encoding="utf-8") + ".generated/\n", encoding="utf-8")
+    generated = workspace / ".generated" / "build.log"
+    generated.parent.mkdir()
+    generated.write_text("ignored\n", encoding="utf-8")
+    assert "!! .generated/" in GitRepository(workspace).status_porcelain(include_ignored=True)
+
+    result, _ = run_agent(task, workspace)
+
+    assert result.success is True
+
+
 def test_context_is_grounded_and_bounded(
     extraction_task: tuple[Path, Task, Path],
 ) -> None:
@@ -367,7 +453,312 @@ def test_context_limits_are_enforced(extraction_task: tuple[Path, Task, Path]) -
     agent = ServiceExtractionAgent(
         FakeRouter([]), limits=ExtractionLimits(max_context_files=2)
     )
-    with pytest.raises(ExtractionEvidenceError, match="file count"):
+    with pytest.raises(ExtractionEvidenceError, match="file count") as error:
+        agent.dry_run(task, make_context(task, workspace))
+    message = str(error.value)
+    assert "candidate=Greeting Service" in message
+    assert "required_file_count=3" in message
+    assert "configured_limit=2" in message
+    assert "required_candidate_owned" in message
+
+
+def _selection_fixture() -> tuple[CandidateService, JavaDependencyGraph, ServiceBoundaryReport]:
+    """Build a small graph for deterministic context-selection tests."""
+    candidate = CandidateService(
+        name="Order",
+        description="Order candidate",
+        classes=["example.order.OrderService"],
+        packages=["example.order"],
+        controllers=[],
+        services=["example.order.OrderService"],
+        repositories=[],
+        confidence=1.0,
+        reasoning="grounded",
+        dependencies_on_other_candidates=[],
+        risks=[],
+    )
+    classes = [
+        JavaClass(
+            name="OrderService",
+            fully_qualified_name="example.order.OrderService",
+            package="example.order",
+            file_path="src/main/java/example/order/OrderService.java",
+            role=JavaClassRole.SERVICE,
+        ),
+        JavaClass(
+            name="OrderPort",
+            fully_qualified_name="example.shared.OrderPort",
+            package="example.shared",
+            file_path="src/main/java/example/shared/OrderPort.java",
+            role=JavaClassRole.OTHER,
+        ),
+        JavaClass(
+            name="OrderConfiguration",
+            fully_qualified_name="example.order.OrderConfiguration",
+            package="example.order",
+            file_path="src/main/java/example/order/OrderConfiguration.java",
+            role=JavaClassRole.CONFIGURATION,
+        ),
+        JavaClass(
+            name="UnrelatedService",
+            fully_qualified_name="example.inventory.UnrelatedService",
+            package="example.inventory",
+            file_path="src/main/java/example/inventory/UnrelatedService.java",
+            role=JavaClassRole.SERVICE,
+        ),
+    ]
+    graph = JavaDependencyGraph(
+        repository_root=".",
+        total_java_classes=len(classes),
+        total_dependency_edges=3,
+        classes=classes,
+        dependencies=[
+            JavaDependency(
+                source="example.order.OrderService",
+                target="example.shared.OrderPort",
+                relationship=JavaDependencyRelationship.FIELD_DEPENDENCY,
+                evidence="field_dependency: OrderPort",
+            ),
+            JavaDependency(
+                source="example.order.OrderService",
+                target="example.order.OrderConfiguration",
+                relationship=JavaDependencyRelationship.CONSTRUCTOR_DEPENDENCY,
+                evidence="constructor_dependency: OrderConfiguration",
+            ),
+        ],
+    )
+    boundary = ServiceBoundaryReport(
+        candidate_services=[candidate],
+        shared_components=[],
+        unresolved_classes=[],
+        overall_reasoning="grounded",
+        warnings=[],
+        model_provider="test",
+        model_name="test",
+    )
+    return candidate, graph, boundary
+
+
+def test_context_selection_prefers_direct_dependencies_and_excludes_unrelated() -> None:
+    candidate, graph, boundary = _selection_fixture()
+    classes_by_name = {item.fully_qualified_name: item for item in graph.classes}
+    selected, diagnostics = _select_context_classes(
+        candidate,
+        graph,
+        boundary,
+        classes_by_name,
+        ExtractionLimits(max_context_files=2),
+    )
+
+    assert [item.fully_qualified_name for item in selected] == [
+        "example.order.OrderService",
+        "example.shared.OrderPort",
+    ]
+    assert diagnostics.selected_file_count == 2
+    assert diagnostics.optional_file_count == 2
+    assert "UnrelatedService.java" not in json.dumps(diagnostics.model_dump())
+
+
+def test_context_selection_is_deterministic_and_retains_merged_internal_classes() -> None:
+    candidate, graph, boundary = _selection_fixture()
+    internal = JavaClass(
+        name="OrderInternal",
+        fully_qualified_name="example.order.internal.OrderInternal",
+        package="example.order.internal",
+        file_path="src/main/java/example/order/internal/OrderInternal.java",
+        role=JavaClassRole.COMPONENT,
+    )
+    candidate.classes.append(internal.fully_qualified_name)
+    graph.classes.append(internal)
+    graph.total_java_classes += 1
+    classes_by_name = {item.fully_qualified_name: item for item in graph.classes}
+    first = _select_context_classes(
+        candidate, graph, boundary, classes_by_name, ExtractionLimits(max_context_files=3)
+    )
+    second = _select_context_classes(
+        candidate, graph, boundary, classes_by_name, ExtractionLimits(max_context_files=3)
+    )
+
+    assert first[0] == second[0]
+    assert first[1] == second[1]
+    required_paths = first[1].selected_files_by_reason["required_candidate_owned"]
+    assert "src/main/java/example/order/internal/OrderInternal.java" in required_paths
+
+
+def test_context_selection_reports_required_files_over_hard_limit() -> None:
+    candidate, graph, boundary = _selection_fixture()
+    candidate.classes.extend(
+        [
+            "example.order.internal.OrderInternalA",
+            "example.order.internal.OrderInternalB",
+        ]
+    )
+    for name in ("OrderInternalA", "OrderInternalB"):
+        graph.classes.append(
+            JavaClass(
+                name=name,
+                fully_qualified_name=f"example.order.internal.{name}",
+                package="example.order.internal",
+                file_path=f"src/main/java/example/order/internal/{name}.java",
+                role=JavaClassRole.COMPONENT,
+            )
+        )
+    classes_by_name = {item.fully_qualified_name: item for item in graph.classes}
+    with pytest.raises(ExtractionEvidenceError, match="file count") as error:
+        _select_context_classes(
+            candidate, graph, boundary, classes_by_name, ExtractionLimits(max_context_files=2)
+        )
+
+    message = str(error.value)
+    assert "required_file_count=3" in message
+    assert "configured_limit=2" in message
+    assert "OrderInternalA.java" in message
+    assert "OrderInternalB.java" in message
+
+
+def _sized_selection_fixture(
+    required_count: int, optional_count: int
+) -> tuple[CandidateService, JavaDependencyGraph, ServiceBoundaryReport]:
+    """Build a graph with a controlled required/optional context size."""
+    required_names = [f"example.order.Required{index}" for index in range(required_count)]
+    optional_names = [f"example.shared.Optional{index}" for index in range(optional_count)]
+    classes = [
+        JavaClass(
+            name=name.rsplit(".", 1)[1],
+            fully_qualified_name=name,
+            package="example.order",
+            file_path=f"src/main/java/example/order/{name.rsplit('.', 1)[1]}.java",
+            role=JavaClassRole.SERVICE,
+        )
+        for name in required_names
+    ]
+    classes.extend(
+        JavaClass(
+            name=name.rsplit(".", 1)[1],
+            fully_qualified_name=name,
+            package="example.shared",
+            file_path=f"src/main/java/example/shared/{name.rsplit('.', 1)[1]}.java",
+            role=JavaClassRole.OTHER,
+        )
+        for name in optional_names
+    )
+    dependencies = [
+        JavaDependency(
+            source=required_names[0],
+            target=name,
+            relationship=JavaDependencyRelationship.FIELD_DEPENDENCY,
+            evidence=f"field_dependency: {name.rsplit('.', 1)[1]}",
+        )
+        for name in optional_names
+    ]
+    candidate = CandidateService(
+        name="Sized Service",
+        description="Sized candidate",
+        classes=required_names,
+        packages=["example.order"],
+        controllers=[],
+        services=required_names,
+        repositories=[],
+        confidence=1.0,
+        reasoning="grounded",
+        dependencies_on_other_candidates=[],
+        risks=[],
+    )
+    graph = JavaDependencyGraph(
+        repository_root=".",
+        total_java_classes=len(classes),
+        total_dependency_edges=len(dependencies),
+        classes=classes,
+        dependencies=dependencies,
+    )
+    boundary = ServiceBoundaryReport(
+        candidate_services=[candidate],
+        shared_components=[],
+        unresolved_classes=[],
+        overall_reasoning="grounded",
+        warnings=[],
+        model_provider="test",
+        model_name="test",
+    )
+    return candidate, graph, boundary
+
+
+def test_six_optional_files_fit_after_ten_required_files_under_default_ceiling() -> None:
+    candidate, graph, boundary = _sized_selection_fixture(10, 10)
+    classes_by_name = {item.fully_qualified_name: item for item in graph.classes}
+
+    selected, diagnostics = _select_context_classes(
+        candidate, graph, boundary, classes_by_name, ExtractionLimits()
+    )
+
+    assert diagnostics.configured_limit == 16
+    assert diagnostics.required_file_count == 10
+    assert diagnostics.optional_file_count == 10
+    assert diagnostics.selected_file_count == 16
+    assert len(selected) == 16
+    assert set(candidate.classes).issubset({item.fully_qualified_name for item in selected})
+
+
+def test_sixteen_required_files_fit_under_default_ceiling() -> None:
+    candidate, graph, boundary = _sized_selection_fixture(16, 3)
+    classes_by_name = {item.fully_qualified_name: item for item in graph.classes}
+
+    selected, diagnostics = _select_context_classes(
+        candidate, graph, boundary, classes_by_name, ExtractionLimits()
+    )
+
+    assert len(selected) == 16
+    assert diagnostics.required_file_count == 16
+    assert diagnostics.selected_file_count == 16
+    assert diagnostics.selected_files_by_reason["direct_compile_dependency"] == []
+
+
+def test_seventeen_required_files_fail_without_truncation() -> None:
+    candidate, graph, boundary = _sized_selection_fixture(17, 3)
+    classes_by_name = {item.fully_qualified_name: item for item in graph.classes}
+
+    with pytest.raises(ExtractionEvidenceError, match="file count") as error:
+        _select_context_classes(candidate, graph, boundary, classes_by_name, ExtractionLimits())
+
+    message = str(error.value)
+    assert "required_file_count=17" in message
+    assert "configured_limit=16" in message
+    assert "Required16.java" in message
+
+
+def test_optional_context_never_displaces_required_files() -> None:
+    candidate, graph, boundary = _sized_selection_fixture(16, 10)
+    classes_by_name = {item.fully_qualified_name: item for item in graph.classes}
+
+    selected, diagnostics = _select_context_classes(
+        candidate, graph, boundary, classes_by_name, ExtractionLimits()
+    )
+
+    assert [item.fully_qualified_name for item in selected] == sorted(candidate.classes)
+    assert diagnostics.selected_file_count == diagnostics.required_file_count == 16
+
+
+def test_context_byte_limits_remain_independent_of_file_ceiling(
+    extraction_task: tuple[Path, Task, Path],
+) -> None:
+    _, task, workspace = extraction_task
+    agent = ServiceExtractionAgent(
+        FakeRouter([]), limits=ExtractionLimits(max_context_bytes_per_file=1)
+    )
+
+    with pytest.raises(ExtractionEvidenceError, match="source file exceeds context limit"):
+        agent.dry_run(task, make_context(task, workspace))
+
+
+def test_total_context_byte_limit_remains_independent_of_file_ceiling(
+    extraction_task: tuple[Path, Task, Path],
+) -> None:
+    _, task, workspace = extraction_task
+    agent = ServiceExtractionAgent(
+        FakeRouter([]), limits=ExtractionLimits(max_total_context_bytes=10)
+    )
+
+    with pytest.raises(ExtractionEvidenceError, match="total byte limit"):
         agent.dry_run(task, make_context(task, workspace))
 
 
