@@ -28,6 +28,7 @@ from migrationswarm.agents.service_boundary import (
     SERVICE_BOUNDARIES_MARKDOWN_ARTIFACT,
     BoundaryResponseError,
     ServiceBoundaryAgent,
+    _deterministic_candidates,
 )
 from migrationswarm.cli.main import app
 from migrationswarm.core.agents import AgentContext, AgentResult
@@ -777,6 +778,84 @@ def test_sanitized_live_response_rejects_omitted_domains(tmp_path: Path) -> None
     write_commerce_evidence(tmp_path)
     with pytest.raises(BoundaryResponseError, match="INCOMPLETE_BOUNDARY_COVERAGE"):
         run_agent(tmp_path, FakeRouter([json.dumps(fixture), json.dumps(fixture)]))
+
+
+def _implementation_component(package: str, stem: str) -> dict[str, Any]:
+    """Build one strong component for deterministic package-accounting tests."""
+    return {
+        "packages": [package],
+        "classes": [
+            f"{package}.{stem}Controller",
+            f"{package}.{stem}Service",
+            f"{package}.{stem}Repository",
+        ],
+        "controller_count": 1,
+        "service_count": 1,
+        "repository_count": 1,
+    }
+
+
+def _implementation_evidence(*components: dict[str, Any]) -> dict[str, Any]:
+    """Build the minimal evidence shape consumed by deterministic candidates."""
+    classes = [
+        {
+            "fully_qualified_name": class_name,
+            "role": role,
+        }
+        for component in components
+        for class_name, role in (
+            (component["classes"][0], "CONTROLLER"),
+            (component["classes"][1], "SERVICE"),
+            (component["classes"][2], "REPOSITORY"),
+        )
+    ]
+    return {"classes": classes, "candidate_components": list(components), "dependencies": []}
+
+
+def test_nested_internal_package_merges_into_parent_module() -> None:
+    evidence = _implementation_evidence(
+        {
+            "packages": ["com.example.orders"],
+            "classes": [
+                "com.example.orders.OrderEvent",
+                "com.example.orders.OrderState",
+                "com.example.orders.OrderPolicy",
+            ],
+            "controller_count": 0,
+            "service_count": 0,
+            "repository_count": 0,
+        },
+        _implementation_component("com.example.orders.internal", "Order")
+    )
+
+    candidates = _deterministic_candidates(evidence)
+
+    assert [item["name"] for item in candidates] == ["Orders"]
+    assert candidates[0]["merged_packages"] == ["com.example.orders.internal"]
+    assert set(evidence["candidate_components"][1]["classes"]) <= set(candidates[0]["classes"])
+
+
+def test_multiple_modules_merge_their_internal_packages_independently() -> None:
+    evidence = _implementation_evidence(
+        _implementation_component("com.example.orders.internal", "Order"),
+        _implementation_component("com.example.billing.internal", "Billing"),
+    )
+
+    candidates = _deterministic_candidates(evidence)
+
+    assert [item["name"] for item in candidates] == ["Billing", "Orders"]
+    assert all(item["merged_packages"] for item in candidates)
+
+
+def test_top_level_internal_package_remains_a_domain_candidate() -> None:
+    evidence = _implementation_evidence(
+        _implementation_component("com.example.internal", "Internal")
+    )
+
+    candidates = _deterministic_candidates(evidence)
+
+    assert [item["name"] for item in candidates] == ["Internal"]
+    assert candidates[0]["merged_packages"] == []
 
 
 def test_all_deterministic_domains_included_are_accepted(tmp_path: Path) -> None:

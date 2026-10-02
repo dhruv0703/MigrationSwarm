@@ -542,6 +542,7 @@ Return ONLY JSON matching the requested schema:
                     "name": item["name"],
                     "classes": item["classes"],
                     "packages": item["packages"],
+                    "merged_packages": item.get("merged_packages", []),
                     "controller_count": item["controller_count"],
                     "service_count": item["service_count"],
                     "repository_count": item["repository_count"],
@@ -626,22 +627,68 @@ class _BoundaryModelOutput(BaseModel):
     warnings: list[str]
 
 
+_IMPLEMENTATION_PACKAGE_SEGMENTS = frozenset(
+    {
+        "adapter",
+        "adapters",
+        "detail",
+        "details",
+        "impl",
+        "implementation",
+        "infra",
+        "infrastructure",
+        "internal",
+    }
+)
+
+
 def _deterministic_candidates(evidence: dict[str, Any]) -> list[dict[str, Any]]:
     """Return strong architecture components that can require a boundary disposition."""
     class_roles = {
         item["fully_qualified_name"]: item.get("role", "")
         for item in evidence.get("classes", [])
     }
-    grouped: dict[str, dict[str, Any]] = {}
+    raw_components: list[tuple[list[str], dict[str, Any]]] = []
+    all_packages: set[str] = set()
     for component in evidence.get("candidate_components", []):
         packages = list(component.get("packages", []))
         if not packages:
             continue
+        raw_components.append((packages, component))
+        all_packages.update(packages)
+
+    application_root = _common_package_prefix(all_packages)
+    identified_parent_packages = {
+        packages[0]
+        for packages, component in raw_components
+        if any(
+            _is_boundary_relevant_class(class_name, class_roles.get(class_name, ""))
+            for class_name in component.get("classes", [])
+        )
+    }
+    strong_packages = {
+        packages[0]
+        for packages, component in raw_components
+        if all(
+            component.get(key, 0) >= 1
+            for key in ("controller_count", "service_count", "repository_count")
+        )
+    }
+    grouped: dict[str, dict[str, Any]] = {}
+    for packages, component in raw_components:
+        primary_package = packages[0]
+        group_key = _implementation_parent_package(
+            primary_package,
+            application_root=application_root,
+            identified_parent_packages=identified_parent_packages,
+            strong_packages=strong_packages,
+        )
         group = grouped.setdefault(
-            packages[0],
+            group_key,
             {
                 "classes": set(),
                 "packages": set(),
+                "merged_packages": set(),
                 "controller_count": 0,
                 "service_count": 0,
                 "repository_count": 0,
@@ -649,6 +696,8 @@ def _deterministic_candidates(evidence: dict[str, Any]) -> list[dict[str, Any]]:
         )
         group["classes"].update(component.get("classes", []))
         group["packages"].update(packages)
+        if group_key != primary_package:
+            group["merged_packages"].add(primary_package)
         for key in ("controller_count", "service_count", "repository_count"):
             group[key] += component.get(key, 0)
 
@@ -681,12 +730,48 @@ def _deterministic_candidates(evidence: dict[str, Any]) -> list[dict[str, Any]]:
                 "name": name,
                 "classes": classes,
                 "packages": sorted(packages),
+                "merged_packages": sorted(component["merged_packages"]),
                 "controller_count": component.get("controller_count", 0),
                 "service_count": component.get("service_count", 0),
                 "repository_count": component.get("repository_count", 0),
             }
         )
     return sorted(result, key=lambda item: item["name"])
+
+
+def _common_package_prefix(packages: set[str]) -> str:
+    """Return the common package prefix used to distinguish modules from root packages."""
+    if not packages:
+        return ""
+    parts = [package.split(".") for package in sorted(packages)]
+    prefix: list[str] = []
+    for values in zip(*parts, strict=False):
+        if len(set(values)) != 1:
+            break
+        prefix.append(values[0])
+    return ".".join(prefix)
+
+
+def _implementation_parent_package(
+    package: str,
+    *,
+    application_root: str,
+    identified_parent_packages: set[str],
+    strong_packages: set[str],
+) -> str:
+    """Merge nested implementation packages into their structural parent when grounded."""
+    parts = package.split(".")
+    if len(parts) < 2 or parts[-1].casefold() not in _IMPLEMENTATION_PACKAGE_SEGMENTS:
+        return package
+
+    parent = ".".join(parts[:-1])
+    root_parts = application_root.split(".") if application_root else []
+    relative_depth = len(parts) - len(root_parts)
+    parent_is_root = parent == application_root
+    nested_module = relative_depth >= 2 and not parent_is_root
+    if parent in identified_parent_packages or parent in strong_packages or nested_module:
+        return parent
+    return package
 
 
 def _is_boundary_relevant_class(class_name: str, role: str) -> bool:
