@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "migrationswarm"
+dynamic = ["version"]
+description = "Foundation for a multi-agent Java modernization system."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "MigrationSwarm Contributors" }]
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "networkx>=3.4,<4",
+    "SQLAlchemy>=2.0,<3",
+    "alembic>=1.14,<2",
+    "psycopg[binary]>=3.2,<4",
+    "redis>=5.2,<6",
+    "rich>=13.9,<16",
+    "structlog>=24.4,<26",
+    "typer>=0.12,<1",
+    "uvicorn[standard]>=0.31,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2,<2",
+    "mypy>=1.13,<2",
+    "pytest>=8.4,<9",
+    "pytest-asyncio>=0.24,<1",
+    "ruff>=0.8,<1",
+    "fakeredis>=2.26,<3",
+]
+
+[project.scripts]
+migrationswarm = "migrationswarm.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "migrationswarm.__version__" }
+
+[tool.setuptools.data-files]
+"share/migrationswarm" = ["alembic.ini"]
+"share/migrationswarm/migrations" = [
+    "migrations/env.py",
+    "migrations/script.py.mako",
+]
+"share/migrationswarm/migrations/versions" = [
+    "migrations/versions/0001_initial_persistence.py",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "tests"]
+strict = true
+ignore_missing_imports = true

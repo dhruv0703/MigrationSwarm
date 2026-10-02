@@ -1,0 +1,36 @@
+{
+  "candidate_services": [
+    {
+      "name": "OrderFlow",
+      "description": "A proposed order flow grouping.",
+      "classes": [
+        "com.example.commerce.orders.OrderController",
+        "com.example.commerce.orders.OrderService",
+        "com.example.commerce.orders.OrderRepository"
+      ],
+      "packages": ["com.example.commerce.orders"],
+      "controllers": ["com.example.commerce.orders.OrderController"],
+      "services": ["com.example.commerce.orders.OrderService"],
+      "repositories": ["com.example.commerce.orders.OrderRepository"],
+      "confidence": 0.91,
+      "reasoning": "The order classes form a cohesive chain.",
+      "dependencies_on_other_candidates": [],
+      "risks": []
+    }
+  ],
+  "shared_components": [],
+  "unresolved_classes": [],
+  "evidence_accounting": [
+    {
+      "candidate": "Orders",
+      "disposition": "INCLUDED",
+      "classes": [
+        "com.example.commerce.orders.OrderController",
+        "com.example.commerce.orders.OrderService",
+        "com.example.commerce.orders.OrderRepository"
+      ]
+    }
+  ],
+  "overall_reasoning": "The response omitted other deterministic domains.",
+  "warnings": []
+}

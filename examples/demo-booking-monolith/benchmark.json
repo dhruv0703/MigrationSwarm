@@ -1,0 +1,21 @@
+{
+  "name": "demo-booking-monolith",
+  "expected_services": ["Reservations", "Payments", "Notifications"],
+  "aliases": {
+    "Reservations": ["ReservationService", "Booking"],
+    "Payments": ["PaymentService", "Billing"],
+    "Notifications": ["NotificationService"]
+  },
+  "package_root": "com.example.booking",
+  "ignored_package_segments": ["shared", "config"],
+  "shared_components": ["NotificationPublisher", "AuditStamp"],
+  "notes": [
+    "ReservationService coordinates payment authorization and notification publication.",
+    "Payment records retain an external reservation reference, creating an imperfect boundary."
+  ],
+  "behavior_checks": [
+    {"name": "create_reservation", "service": "Reservations", "source_markers": ["reserve(", "ReservationRepository"], "generated_markers": ["behavior:create_reservation"], "operation": "create_reservation", "expected_output": {"created": true}, "expected_status": 201, "expected_state": {"reservation": "CONFIRMED"}, "expected_side_effects": [{"kind": "persistence", "target": "ReservationRepository", "operation": "save"}], "api": {"method": "POST", "path": "/reservations", "request_fields": {"request": "ReservationRequest"}, "response_fields": {"$return": "ReservationDto"}, "required_fields": ["NotBlank"], "response_status": 201}, "consumer_provider": {"provider": "Payments", "operation": "authorize", "request_type": "PaymentRequest", "response_type": "PaymentResult"}, "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "process_payment", "service": "Payments", "source_markers": ["authorize(", "PaymentRepository"], "generated_markers": ["behavior:process_payment"], "operation": "process_payment", "expected_output": {"authorized": true}, "expected_status": 200, "expected_state": {"payment": "AUTHORIZED"}, "expected_side_effects": [{"kind": "persistence", "target": "PaymentRepository", "operation": "save"}], "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "send_booking_notification", "service": "Notifications", "source_markers": ["publish(", "BookingNotificationRepository"], "generated_markers": ["behavior:send_booking_notification"], "operation": "send_booking_notification", "expected_output": {"sent": true}, "expected_status": 202, "expected_state": {"notification": "PUBLISHED"}, "expected_side_effects": [{"kind": "external", "target": "BookingNotificationRepository", "operation": "publish"}], "normalization_fields": ["requestId", "timestamp"]}
+  ]
+}

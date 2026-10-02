@@ -1,0 +1,23 @@
+{
+  "name": "demo-commerce-monolith",
+  "expected_services": ["Inventory", "Notifications", "Orders", "Customers"],
+  "aliases": {
+    "Inventory": ["InventoryService"],
+    "Notifications": ["NotificationService"],
+    "Orders": ["OrderService", "Order"]
+  },
+  "package_root": "com.example.commerce",
+  "ignored_package_segments": ["shared", "config"],
+  "shared_components": ["AuditStamp", "DomainEvent", "Money", "SharedEventPublisher"],
+  "notes": [
+    "Orders depend on Inventory through InventoryGateway.",
+    "Shared event and value-object classes are intentionally not assigned to one service.",
+    "Customers is a defensible fourth boundary with its own entity, controller, service, and repository."
+  ],
+  "behavior_checks": [
+    {"name": "create_order", "service": "Orders", "source_markers": ["place(", "DomainEvent"], "generated_markers": ["behavior:create_order"], "operation": "create_order", "expected_output": {"accepted": true}, "expected_status": 200, "expected_state": {"order": "CREATED"}, "expected_side_effects": [{"kind": "event", "target": "DomainEvent", "operation": "publish"}], "api": {"method": "POST", "path": "/orders", "request_fields": {"request": "OrderRequest"}, "response_fields": {"$return": "OrderDto"}, "required_fields": ["NotBlank"], "response_status": 200}, "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "reserve_inventory", "service": "Inventory", "source_markers": ["reserve(", "InventoryRepository"], "generated_markers": ["behavior:reserve_inventory"], "operation": "reserve_inventory", "expected_output": {"reserved": true}, "expected_status": 200, "expected_state": {"inventory": "RESERVED"}, "expected_side_effects": [{"kind": "persistence", "target": "InventoryRepository", "operation": "save"}], "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "send_notification", "service": "Notifications", "source_markers": ["publish(", "NotificationRepository"], "generated_markers": ["behavior:send_notification"], "operation": "send_notification", "expected_output": {"sent": true}, "expected_status": 202, "expected_state": {"notification": "PUBLISHED"}, "expected_side_effects": [{"kind": "persistence", "target": "NotificationRepository", "operation": "save"}], "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "find_or_create_customer", "service": "Customers", "source_markers": ["findOrCreate(", "CustomerRepository"], "generated_markers": ["behavior:find_or_create_customer"], "operation": "find_or_create_customer", "expected_output": {"foundOrCreated": true}, "expected_status": 200, "expected_state": {"customer": "AVAILABLE"}, "expected_side_effects": [{"kind": "persistence", "target": "CustomerRepository", "operation": "save"}], "normalization_fields": ["requestId", "timestamp"]}
+  ]
+}

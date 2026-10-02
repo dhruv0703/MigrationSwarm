@@ -1,0 +1,26 @@
+{
+  "name": "demo-fulfillment-monolith",
+  "expected_services": ["Orders", "Inventory", "Shipping", "Billing", "Notifications"],
+  "aliases": {
+    "Orders": ["OrderService"],
+    "Inventory": ["InventoryService"],
+    "Shipping": ["ShippingService"],
+    "Billing": ["BillingService"],
+    "Notifications": ["NotificationService"]
+  },
+  "package_root": "com.example.fulfillment",
+  "ignored_package_segments": ["shared", "config"],
+  "shared_components": ["Address", "Money", "FulfillmentRequest", "AuditRecord", "WorkflowClock"],
+  "notes": [
+    "OrderService and InventoryService form a controlled circular dependency.",
+    "OrderService coordinates writes to order, inventory, and billing repositories in one transaction.",
+    "ShippingService directly reads OrderRepository and BillingAccount is referenced by multiple domains."
+  ],
+  "behavior_checks": [
+    {"name": "place_order", "service": "Orders", "source_markers": ["placeOrder(", "OrderRepository"], "generated_markers": ["behavior:place_order"], "operation": "place_order", "expected_output": {"accepted": true}, "expected_status": 200, "expected_state": {"order": "PLACED"}, "expected_side_effects": [{"kind": "persistence", "target": "OrderRepository", "operation": "save"}], "api": {"method": "POST", "path": "/orders", "request_fields": {"request": "OrderRequest"}, "response_fields": {"$return": "OrderDto"}, "required_fields": ["NotBlank"], "response_status": 200}, "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "reserve_inventory", "service": "Inventory", "source_markers": ["reserve(", "InventoryRepository"], "generated_markers": ["behavior:reserve_inventory"], "operation": "reserve_inventory", "expected_output": {"reserved": true}, "expected_status": 200, "expected_state": {"inventory": "RESERVED"}, "expected_side_effects": [{"kind": "persistence", "target": "InventoryRepository", "operation": "save"}], "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "create_shipping_label", "service": "Shipping", "source_markers": ["createLabel(", "ShippingRepository"], "generated_markers": ["behavior:create_shipping_label"], "operation": "create_shipping_label", "expected_output": {"created": true}, "expected_status": 201, "expected_state": {"shipment": "LABELED"}, "expected_side_effects": [{"kind": "persistence", "target": "ShippingRepository", "operation": "save"}], "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "charge_order", "service": "Billing", "source_markers": ["charge(", "BillingRepository"], "generated_markers": ["behavior:charge_order"], "operation": "charge_order", "expected_output": {"charged": true}, "expected_status": 200, "expected_state": {"billing": "CHARGED"}, "expected_side_effects": [{"kind": "persistence", "target": "BillingRepository", "operation": "save"}], "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "publish_fulfillment_event", "service": "Notifications", "source_markers": ["publish(", "FulfillmentEvent"], "generated_markers": ["behavior:publish_fulfillment_event"], "operation": "publish_fulfillment_event", "expected_output": {"published": true}, "expected_status": 202, "expected_state": {"event": "PUBLISHED"}, "expected_side_effects": [{"kind": "event", "target": "FulfillmentEvent", "operation": "publish"}], "normalization_fields": ["requestId", "timestamp"]}
+  ]
+}

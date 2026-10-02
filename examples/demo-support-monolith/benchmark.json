@@ -1,0 +1,21 @@
+{
+  "name": "demo-support-monolith",
+  "expected_services": ["Tickets", "Users", "Notifications"],
+  "aliases": {
+    "Tickets": ["TicketService"],
+    "Users": ["UserService"],
+    "Notifications": ["NotificationService"]
+  },
+  "package_root": "com.example.support",
+  "ignored_package_segments": ["shared", "config"],
+  "shared_components": ["NotificationClient", "AuditContext"],
+  "notes": [
+    "TicketService coordinates user lookup and notification delivery.",
+    "NotificationClient is shared infrastructure and is not an independent service boundary."
+  ],
+  "behavior_checks": [
+    {"name": "open_ticket", "service": "Tickets", "source_markers": ["open(", "TicketRepository"], "generated_markers": ["behavior:open_ticket"], "operation": "open_ticket", "expected_output": {"opened": true}, "expected_status": 201, "expected_state": {"ticket": "OPEN"}, "expected_side_effects": [{"kind": "persistence", "target": "TicketRepository", "operation": "save"}], "api": {"method": "POST", "path": "/tickets", "request_fields": {"request": "TicketRequest"}, "response_fields": {"$return": "TicketDto"}, "required_fields": ["NotBlank"], "response_status": 201}, "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "require_active_user", "service": "Users", "source_markers": ["requireActive(", "SupportUserRepository"], "generated_markers": ["behavior:require_active_user"], "operation": "require_active_user", "expected_output": {"active": true}, "expected_status": 200, "expected_state": {"user": "ACTIVE"}, "expected_side_effects": [], "normalization_fields": ["requestId", "timestamp"]},
+    {"name": "notify_user", "service": "Notifications", "source_markers": ["send(", "NotificationClient"], "generated_markers": ["behavior:notify_user"], "operation": "notify_user", "expected_output": {"sent": true}, "expected_status": 202, "expected_state": {"notification": "SENT"}, "expected_side_effects": [{"kind": "external", "target": "NotificationClient", "operation": "send"}], "normalization_fields": ["requestId", "timestamp"]}
+  ]
+}
